@@ -1,27 +1,16 @@
 // api/company.js
-// Multi-source aggregator for company info.
-// Sources: Wikipedia (scrape), Wikidata (API), Finnhub or Yahoo Finance (optional),
-// OpenCorporates (optional), Google News RSS (no key), GitHub org (best-effort).
-//
-// Requires: @sparticuz/chromium, puppeteer-core
-// Local dev: puppeteer (devDependency)
+// Multi-source aggregator without news. Adds social links from the official website.
+// HQ is split into place, city, region, country (+ coords if available).
 
 const chromium = require("@sparticuz/chromium");
 const puppeteerCore = require("puppeteer-core");
 let localPuppeteer; try { localPuppeteer = require("puppeteer"); } catch {}
 
-// ---------- small utils ----------
-const unique = (arr) => Array.from(new Set((arr || []).filter(Boolean).map(s => String(s).trim()).filter(Boolean)));
+const unique = (arr) => Array.from(new Set((arr || []).filter(Boolean).map(x => String(x).trim()).filter(Boolean)));
 const cleanText = (s) => (s || "").replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim();
-const pick = (obj, keys) => Object.fromEntries(keys.map(k => [k, obj?.[k] ?? null]));
-
 const RE_QID = /^Q\d+$/i;
 
-// Prefer US exchange tickers when multiple are present
-const EXCHANGE_PREFERENCE = [
-  "NASDAQ", "NYSE", "NYSE ARCA", "NYSE American",
-  "LSE", "TSE", "HKEX"
-];
+const EXCHANGE_PREFERENCE = ["NASDAQ","NYSE","NYSE ARCA","NYSE American","LSE","TSE","HKEX"];
 
 // ---------- Wikipedia helpers ----------
 async function wikipediaSearchTitle(query) {
@@ -95,7 +84,7 @@ function extractFromWikidata(entity) {
   const tickers = tickerStmts.map(st => {
     const symbol = st.mainsnak?.datavalue?.value || null;
     const exchangeId = st.qualifiers?.P414?.[0]?.datavalue?.value?.id || null;
-    return symbol && exchangeId ? { symbol, exchangeId } : (symbol ? { symbol, exchangeId: null } : null);
+    return symbol ? { symbol, exchangeId } : null;
   }).filter(Boolean);
 
   return { website, employees, industryIds, headquartersId, typeIds, tickers };
@@ -103,6 +92,84 @@ function extractFromWikidata(entity) {
 
 function resolveLabels(entities, ids) {
   return (ids || []).map(id => entities?.[id]?.labels?.en?.value || null).filter(Boolean);
+}
+
+// Build structured HQ from Wikidata entity (place/city/region/country/coords)
+async function buildHeadquarters(entities, headquartersId) {
+  if (!headquartersId || !entities?.[headquartersId]) return null;
+  const hq = entities[headquartersId];
+
+  const label = hq.labels?.en?.value || null;
+
+  const getClaimId = (e, pid) => e?.claims?.[pid]?.[0]?.mainsnak?.datavalue?.value?.id || null;
+  const getClaimVal = (e, pid) => e?.claims?.[pid]?.[0]?.mainsnak?.datavalue?.value || null;
+
+  // Country via P17
+  const countryId = getClaimId(hq, "P17");
+
+  // Admin chain via P131 (located in the administrative territorial entity) – follow up to two levels
+  const admin1Id = getClaimId(hq, "P131");
+  let admin2Id = null;
+
+  // We may need to fetch parent entities if not present
+  const toFetch = unique([admin1Id, countryId].filter(Boolean));
+  let more = {};
+  if (toFetch.length) {
+    more = await getWikidataEntities(toFetch) || {};
+  }
+
+  if (admin1Id && more[admin1Id]) {
+    admin2Id = getClaimId(more[admin1Id], "P131") || null;
+    if (admin2Id && !more[admin2Id]) {
+      const more2 = await getWikidataEntities([admin2Id]) || {};
+      more = { ...more, ...more2 };
+    }
+  }
+
+  const country = countryId ? (entities[countryId]?.labels?.en?.value || more[countryId]?.labels?.en?.value || null) : null;
+
+  // Try to decide city vs region:
+  const INSTANCE_OF = "P31";
+  const Q_CITY = "Q515";             // city
+  const Q_HUMAN_SETTLEMENT = "Q486972";
+  const looksLike = (e, qid) => (e?.claims?.[INSTANCE_OF] || []).some(st => st.mainsnak?.datavalue?.value?.id === qid);
+
+  let city = null, region = null;
+
+  const admin1 = admin1Id ? (entities[admin1Id] || more[admin1Id]) : null;
+  const admin2 = admin2Id ? (entities[admin2Id] || more[admin2Id]) : null;
+
+  if (admin1) {
+    if (looksLike(admin1, Q_CITY) || looksLike(admin1, Q_HUMAN_SETTLEMENT)) city = admin1.labels?.en?.value;
+    else region = admin1.labels?.en?.value;
+  }
+  if (!city && admin2) {
+    if (looksLike(admin2, Q_CITY) || looksLike(admin2, Q_HUMAN_SETTLEMENT)) city = admin2.labels?.en?.value;
+    else if (!region) region = admin2.labels?.en?.value;
+  }
+
+  // Coordinates (P625)
+  const coords = getClaimVal(hq, "P625"); // { latitude, longitude, ... } or globecoordinate
+  const coordinates = coords && (typeof coords.latitude === "number" && typeof coords.longitude === "number")
+    ? { lat: coords.latitude, lon: coords.longitude }
+    : null;
+
+  // If we still lack city/region, try to parse the label by commas
+  if (!city || !country) {
+    const parsed = (label || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (!city && parsed.length >= 2) city = parsed[0];
+    if (!region && parsed.length >= 3) region = parsed[1];
+    if (!country && parsed.length) country = parsed[parsed.length - 1];
+  }
+
+  return {
+    raw: label,
+    place: label,     // most-specific place (e.g., "Mountain View")
+    city: city || null,
+    region: region || null,
+    country: country || null,
+    coordinates
+  };
 }
 
 // ---------- Finance ----------
@@ -127,13 +194,10 @@ async function fetchYahooFinance(symbol) {
   const r = j?.quoteSummary?.result?.[0];
   if (!r) return null;
   const price = r.price?.regularMarketPrice?.raw ?? r.price?.postMarketPrice?.raw ?? null;
-
-  // Market cap may be in price or defaultKeyStatistics/summaryDetail
   const mc = r.price?.marketCap?.raw
     ?? r.summaryDetail?.marketCap?.raw
     ?? r.defaultKeyStatistics?.enterpriseValue?.raw
     ?? null;
-
   return {
     stock_price: typeof price === "number" ? price : null,
     market_cap: typeof mc === "number" ? mc : null
@@ -155,38 +219,66 @@ async function fetchOpenCorporates(query) {
   };
 }
 
-// ---------- News (Google News RSS) ----------
-async function fetchNews(query, maxItems = 5) {
-  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
-  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) return [];
-  const xml = await res.text();
-  const items = [];
-  // naive RSS parse – good enough for top few items
-  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-  let m;
-  while ((m = itemRegex.exec(xml)) && items.length < maxItems) {
-    const block = m[1];
-    const title = (block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || [])[1]
-               || (block.match(/<title>(.*?)<\/title>/) || [])[1] || null;
-    const link  = (block.match(/<link>(.*?)<\/link>/) || [])[1] || null;
-    const pub   = (block.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1] || null;
-    const source= (block.match(/<source[^>]*>(.*?)<\/source>/) || [])[1] || null;
-    items.push({ title, url: link, source, date: pub });
-  }
-  return items;
+// ---------- Social links from company website ----------
+const SOCIAL_DOMAINS = {
+  x: ["x.com","twitter.com"],
+  facebook: ["facebook.com"],
+  instagram: ["instagram.com"],
+  youtube: ["youtube.com","youtu.be"],
+  linkedin: ["linkedin.com"],
+  tiktok: ["tiktok.com"],
+  github: ["github.com"],
+  medium: ["medium.com"],
+  reddit: ["reddit.com"],
+  threads: ["threads.net"],
+  bluesky: ["bsky.app"],
+  mastodon: ["mastodon.social","fosstodon.org","hachyderm.io"], // plus any rel=me links
+  pinterest: ["pinterest.com"]
+};
+
+function classifySocial(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    for (const [key, domains] of Object.entries(SOCIAL_DOMAINS)) {
+      if (domains.some(d => host === d || host.endsWith(`.${d}`))) return key;
+    }
+    return null;
+  } catch { return null; }
 }
 
-// ---------- GitHub org (best-effort) ----------
-async function fetchGithubOrg(query) {
-  // Try to find an org matching the company name
-  const url = `https://api.github.com/search/users?q=${encodeURIComponent(query)}+type:org&per_page=1`;
-  const res = await fetch(url, { headers: { "User-Agent": "vercel-puppeteer-company/1.0" } });
-  if (!res.ok) return null;
-  const j = await res.json();
-  const org = j?.items?.[0];
-  if (!org) return null;
-  return org.login || null; // e.g., "google"
+async function fetchCompanySocials(website) {
+  if (!website) return null;
+  try {
+    // Normalize: ensure protocol
+    const url = website.startsWith("http") ? website : `https://${website}`;
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    // Extract hrefs (simple scan)
+    const hrefs = Array.from(html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)).map(m => m[1]);
+
+    // Also look for rel="me" links (Mastodon/identity)
+    const relMe = Array.from(html.matchAll(/<a[^>]+rel=["'][^"']*?\bme\b[^"']*?["'][^>]*href=["']([^"']+)["']/gi))
+      .map(m => m[1]);
+
+    const links = unique([...hrefs, ...relMe].filter(h => /^https?:\/\//i.test(h)));
+
+    const result = {};
+    for (const link of links) {
+      const key = classifySocial(link);
+      if (key) {
+        if (!result[key]) result[key] = link;
+        // Prefer more "official-looking" links for some platforms (e.g., /company/ vs /share)
+        // Keep the first seen; you can add smarter heuristics later.
+      }
+    }
+
+    return Object.keys(result).length ? result : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------- Puppeteer: scrape Wikipedia infobox ----------
@@ -284,6 +376,8 @@ module.exports = async function handler(req, res) {
     // Pull from Wikidata
     let enriched = {};
     let tickers = [];
+    let hqStruct = null;
+
     if (wikidataId) {
       const entities = await getWikidataEntities([wikidataId]);
       const main = entities?.[wikidataId] || null;
@@ -299,8 +393,13 @@ module.exports = async function handler(req, res) {
       const labelEntities = idsToResolve.length ? await getWikidataEntities(idsToResolve) : null;
 
       const industries = resolveLabels(labelEntities, industryIds || []);
-      const headquartersLabel = resolveLabels(labelEntities, headquartersId ? [headquartersId] : [])[0] || null;
       const types = resolveLabels(labelEntities, typeIds || []);
+
+      // Build HQ structured object
+      if (headquartersId) {
+        const extended = { ...(labelEntities || {}), ...(entities || {}) };
+        hqStruct = await buildHeadquarters(extended, headquartersId);
+      }
 
       // Build ticker list with exchange names
       tickers = (tickerPairs || []).map(t => ({
@@ -312,7 +411,6 @@ module.exports = async function handler(req, res) {
         website: wdWebsite || null,
         company_size: wdEmployees || null,
         industry: industries.length ? industries : null,
-        headquarters: headquartersLabel || null,
         type: types.length ? types.join(", ") : null
       };
     }
@@ -320,7 +418,6 @@ module.exports = async function handler(req, res) {
     // Choose a primary ticker if any
     const choosePrimaryTicker = (arr) => {
       if (!arr?.length) return null;
-      // Prefer NASDAQ/NYSE, else first
       for (const pref of EXCHANGE_PREFERENCE) {
         const hit = arr.find(t => (t.exchange || "").toUpperCase().includes(pref));
         if (hit) return hit.symbol;
@@ -329,13 +426,12 @@ module.exports = async function handler(req, res) {
     };
     const primaryTicker = choosePrimaryTicker(tickers);
 
-    // Finance: try Finnhub (if key), else Yahoo as a best-effort fallback
+    // Finance: try Finnhub (if key), else Yahoo as a fallback
     let financials = null;
     if (primaryTicker) {
       financials = await fetchFinnhubQuote(primaryTicker) || await fetchYahooFinance(primaryTicker);
       if (financials) {
         financials.ticker = primaryTicker;
-        // Pretty-print market cap if present
         if (typeof financials.market_cap === "number") {
           const cap = financials.market_cap;
           const fmt = cap >= 1e12 ? `${(cap/1e12).toFixed(2)}T`
@@ -347,14 +443,8 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // OpenCorporates (optional, with or without token, but token avoids hard rate limits)
+    // OpenCorporates (optional)
     const openCorporates = await fetchOpenCorporates(q);
-
-    // News (top 5)
-    const news = await fetchNews(q, 5);
-
-    // GitHub org (best-effort)
-    const githubOrg = await fetchGithubOrg(q);
 
     // Merge baseline + enriched
     const merged = {
@@ -362,19 +452,27 @@ module.exports = async function handler(req, res) {
       website: enriched.website || wiki.website || null,
       employees: enriched.company_size || wiki.company_size || null,
       industry: unique([...(wiki.industry || []), ...(enriched.industry || [])]),
-      headquarters: enriched.headquarters || wiki.headquarters || null,
+      // HQ structured (prefer Wikidata struct; else try to parse Wikipedia text)
+      headquarters: hqStruct || (wiki.headquarters ? {
+        raw: wiki.headquarters,
+        place: wiki.headquarters.split(",")[0]?.trim() || null,
+        city: wiki.headquarters.split(",")[1]?.trim() || null,
+        region: wiki.headquarters.split(",")[2]?.trim() || null,
+        country: wiki.headquarters.split(",").slice(-1)[0]?.trim() || null,
+        coordinates: null
+      } : null),
       type: enriched.type || wiki.type || null,
       specialties: unique(wiki.specialties || [])
     };
 
+    // Socials from company website (if any)
+    const socials = await fetchCompanySocials(merged.website);
+
     const payload = {
       ...merged,
-      financials: financials ? pick(financials, ["ticker","market_cap","stock_price"]) : null,
+      financials: financials ? { ticker: financials.ticker, market_cap: financials.market_cap || null, stock_price: financials.stock_price || null } : null,
       open_corporates: openCorporates || null,
-      news,
-      social: {
-        github_org: githubOrg || null
-      }
+      social: socials || null
     };
 
     res.status(200).json({
@@ -385,12 +483,11 @@ module.exports = async function handler(req, res) {
         wikidata: wikidataId || null,
         finance: financials ? (process.env.FINNHUB_API_KEY ? "Finnhub" : "YahooFinance") : null,
         open_corporates: !!openCorporates,
-        news: "GoogleNewsRSS",
-        github: !!githubOrg
+        socials_from: payload.website || null
       },
       scrapedAt: new Date().toISOString(),
       data: payload,
-      tickers // exposed for debugging; remove if you like
+      tickers // keep for debugging; remove if you want
     });
 
   } catch (err) {
