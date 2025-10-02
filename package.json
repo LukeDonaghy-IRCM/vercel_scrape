@@ -1,21 +1,17 @@
 {
   "name": "vercel-puppeteer-scraper",
-  "version": "1.0.0",
   "private": true,
-  "description": "Simple Puppeteer scraper on Vercel Serverless Functions",
-  "main": "index.js",
+  "version": "1.0.1",
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel --prod"
   },
-  "engines": {
-    "node": ">=20"
-  },
+  "engines": { "node": ">=20" },
   "dependencies": {
-    "@sparticuz/chromium": "^126.0.0",
-    "puppeteer-core": "^23.0.0"
+    "@sparticuz/chromium": "^135.0.0",
+    "puppeteer-core": "^24.2.0"
   },
   "devDependencies": {
-    "puppeteer": "^23.0.0"
+    "puppeteer": "^24.2.0"
   }
 }
