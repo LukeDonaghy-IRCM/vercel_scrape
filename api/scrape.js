@@ -60,14 +60,20 @@ function extractFromWikidata(entity) {
   // Website (P856)
   const website = claims.P856?.[0]?.mainsnak?.datavalue?.value || null;
 
-  // Employees (P1128)
+  // Employees (P1128) -> structured
   let employees = null;
   const emp = latestByP585(claims.P1128);
   if (emp?.mainsnak?.datavalue?.value) {
     const v = emp.mainsnak.datavalue.value; // { amount:"+12345" }
     const raw = (v.amount || "").replace(/^\+/, "");
-    const date = emp.qualifiers?.P585?.[0]?.datavalue?.value?.time?.replace(/[+T].*$/,"") || null;
-    employees = raw ? `${Number(raw).toLocaleString()}${date ? ` (as of ${date})` : ""}` : null;
+    const count = raw ? Number(raw) : null;
+
+    const dateStr = emp.qualifiers?.P585?.[0]?.datavalue?.value?.time || null; // "+2024-06-30T00:00:00Z"
+    const as_of = dateStr ? dateStr.replace(/^[+]/, "").replace(/T.*$/, "") : null; // "2024-06-30"
+
+    if (Number.isFinite(count) || as_of) {
+      employees = { count: Number.isFinite(count) ? count : null, as_of: as_of || null };
+    }
   }
 
   // Industries (P452) -> Qids
@@ -78,6 +84,17 @@ function extractFromWikidata(entity) {
 
   // Type (P31) -> array of Qids
   const typeIds = (claims.P31 || []).map(x => x.mainsnak?.datavalue?.value?.id).filter(Boolean);
+
+  // Stock ticker(s) (P249) + Exchange (P414)
+  const tickerStmts = (claims.P249 || []);
+  const tickers = tickerStmts.map(st => {
+    const symbol = st.mainsnak?.datavalue?.value || null;
+    const exchangeId = st.qualifiers?.P414?.[0]?.datavalue?.value?.id || null;
+    return symbol ? { symbol, exchangeId } : null;
+  }).filter(Boolean);
+
+    return { website, employees, industryIds, headquartersId, typeIds, tickers };
+  }
 
   // Stock ticker(s) (P249) + Exchange (P414)
   const tickerStmts = (claims.P249 || []);
