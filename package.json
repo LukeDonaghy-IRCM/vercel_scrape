@@ -8,10 +8,10 @@
   },
   "engines": { "node": ">=20" },
   "dependencies": {
-    "@sparticuz/chromium": "^135.0.0",
-    "puppeteer-core": "^24.2.0"
+    "@sparticuz/chromium": "140.0.0",
+    "puppeteer-core": "24.23.0"
   },
   "devDependencies": {
-    "puppeteer": "^24.2.0"
+    "puppeteer": "24.23.0"
   }
 }
