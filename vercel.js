@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "api/scrape.js": {
+      "runtime": "nodejs20.x",
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  }
+}
