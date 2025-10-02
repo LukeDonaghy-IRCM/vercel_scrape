@@ -1,18 +1,23 @@
 // api/company.js
-// Multi-source aggregator without news. Adds social links from the official website.
-// HQ is split into place, city, region, country (+ coords if available).
+// Multi-source company aggregator (Wikipedia + Wikidata + Finance + OpenCorporates + Socials)
+// - NO news
+// - Social links are extracted from the official corporate website
+// - Headquarters is structured (place, city, region, country, coordinates)
+// - Employees is structured { count, as_of }
+//
+// Works on Vercel Serverless with puppeteer-core + @sparticuz/chromium,
+// and locally with devDependency "puppeteer".
 
 const chromium = require("@sparticuz/chromium");
 const puppeteerCore = require("puppeteer-core");
 let localPuppeteer; try { localPuppeteer = require("puppeteer"); } catch {}
 
 const unique = (arr) => Array.from(new Set((arr || []).filter(Boolean).map(x => String(x).trim()).filter(Boolean)));
-const cleanText = (s) => (s || "").replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim();
 const RE_QID = /^Q\d+$/i;
 
-const EXCHANGE_PREFERENCE = ["NASDAQ","NYSE","NYSE ARCA","NYSE American","LSE","TSE","HKEX"];
+const EXCHANGE_PREFERENCE = ["NASDAQ","NYSE","NYSE ARCA","NYSE AMERICAN","LSE","TSE","HKEX"];
 
-// ---------- Wikipedia helpers ----------
+/* ----------------------------- Wikipedia helpers ----------------------------- */
 async function wikipediaSearchTitle(query) {
   const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=1&format=json&utf8=1&srwhat=text&srinfo=suggestion`;
   const res = await fetch(url, { headers: { "User-Agent": "vercel-puppeteer-company/1.0" } });
@@ -32,7 +37,7 @@ async function getWikidataIdForTitle(title) {
   return first?.pageprops?.wikibase_item || null;
 }
 
-// ---------- Wikidata helpers ----------
+/* ----------------------------- Wikidata helpers ------------------------------ */
 async function getWikidataEntities(ids) {
   const qids = (ids || []).filter(id => RE_QID.test(id));
   if (!qids.length) return null;
@@ -85,18 +90,7 @@ function extractFromWikidata(entity) {
   // Type (P31) -> array of Qids
   const typeIds = (claims.P31 || []).map(x => x.mainsnak?.datavalue?.value?.id).filter(Boolean);
 
-  // Stock ticker(s) (P249) + Exchange (P414)
-  const tickerStmts = (claims.P249 || []);
-  const tickers = tickerStmts.map(st => {
-    const symbol = st.mainsnak?.datavalue?.value || null;
-    const exchangeId = st.qualifiers?.P414?.[0]?.datavalue?.value?.id || null;
-    return symbol ? { symbol, exchangeId } : null;
-  }).filter(Boolean);
-
-    return { website, employees, industryIds, headquartersId, typeIds, tickers };
-  }
-
-  // Stock ticker(s) (P249) + Exchange (P414)
+  // Stock tickers (P249) + Exchange (P414)
   const tickerStmts = (claims.P249 || []);
   const tickers = tickerStmts.map(st => {
     const symbol = st.mainsnak?.datavalue?.value || null;
@@ -111,24 +105,64 @@ function resolveLabels(entities, ids) {
   return (ids || []).map(id => entities?.[id]?.labels?.en?.value || null).filter(Boolean);
 }
 
-// Build structured HQ from Wikidata entity (place/city/region/country/coords)
+/* ----------------------------- Employees (Wiki) ------------------------------ */
+function parseEmployeesString(raw) {
+  if (!raw) return null;
+
+  // Extract a number (ignore commas/spaces/periods).
+  const numMatch = raw.replace(/[,.\s]/g, '').match(/\d{3,}/); // 3+ digits
+  const count = numMatch ? Number(numMatch[0]) : null;
+
+  // Extract date/year from within parentheses or anywhere.
+  const paren = raw.match(/\(([^)]+)\)/);
+  const chunk = (paren ? paren[1] : raw);
+
+  const dmy = chunk.match(/(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})/);
+  const mdy = chunk.match(/([A-Za-z]{3,}\s+\d{1,2},?\s+\d{4})/);
+  const iso = chunk.match(/(\d{4}-\d{2}-\d{2})/);
+  const ym  = chunk.match(/([A-Za-z]{3,}\s+\d{4})/);
+  const yr  = chunk.match(/(\d{4})/);
+
+  const pick = (m) => (m && m[1]) ? m[1] : null;
+  const found = pick(iso) || pick(dmy) || pick(mdy) || pick(ym) || pick(yr);
+
+  let as_of = null;
+  if (found) {
+    try {
+      if (/^\d{4}$/.test(found)) {
+        as_of = `${found}-01-01`;
+      } else {
+        const dt = new Date(found);
+        if (!isNaN(dt)) {
+          const y = dt.getUTCFullYear();
+          const m = String(dt.getUTCMonth()+1).padStart(2, '0');
+          const d = String(dt.getUTCDate()).padStart(2, '0');
+          as_of = `${y}-${m}-${d}`;
+        }
+      }
+    } catch {}
+  }
+
+  if (Number.isFinite(count) || as_of) return { count: Number.isFinite(count) ? count : null, as_of: as_of || null };
+  return null;
+}
+
+/* -------------------------- Structured Headquarters -------------------------- */
 async function buildHeadquarters(entities, headquartersId) {
   if (!headquartersId || !entities?.[headquartersId]) return null;
   const hq = entities[headquartersId];
 
   const label = hq.labels?.en?.value || null;
-
   const getClaimId = (e, pid) => e?.claims?.[pid]?.[0]?.mainsnak?.datavalue?.value?.id || null;
   const getClaimVal = (e, pid) => e?.claims?.[pid]?.[0]?.mainsnak?.datavalue?.value || null;
 
-  // Country via P17
+  // Country (P17)
   const countryId = getClaimId(hq, "P17");
 
-  // Admin chain via P131 (located in the administrative territorial entity) – follow up to two levels
+  // Admin chain via P131 (located in the administrative territorial entity)
   const admin1Id = getClaimId(hq, "P131");
   let admin2Id = null;
 
-  // We may need to fetch parent entities if not present
   const toFetch = unique([admin1Id, countryId].filter(Boolean));
   let more = {};
   if (toFetch.length) {
@@ -145,14 +179,12 @@ async function buildHeadquarters(entities, headquartersId) {
 
   const country = countryId ? (entities[countryId]?.labels?.en?.value || more[countryId]?.labels?.en?.value || null) : null;
 
-  // Try to decide city vs region:
   const INSTANCE_OF = "P31";
-  const Q_CITY = "Q515";             // city
+  const Q_CITY = "Q515";
   const Q_HUMAN_SETTLEMENT = "Q486972";
   const looksLike = (e, qid) => (e?.claims?.[INSTANCE_OF] || []).some(st => st.mainsnak?.datavalue?.value?.id === qid);
 
   let city = null, region = null;
-
   const admin1 = admin1Id ? (entities[admin1Id] || more[admin1Id]) : null;
   const admin2 = admin2Id ? (entities[admin2Id] || more[admin2Id]) : null;
 
@@ -166,12 +198,12 @@ async function buildHeadquarters(entities, headquartersId) {
   }
 
   // Coordinates (P625)
-  const coords = getClaimVal(hq, "P625"); // { latitude, longitude, ... } or globecoordinate
+  const coords = getClaimVal(hq, "P625");
   const coordinates = coords && (typeof coords.latitude === "number" && typeof coords.longitude === "number")
     ? { lat: coords.latitude, lon: coords.longitude }
     : null;
 
-  // If we still lack city/region, try to parse the label by commas
+  // Fallback parse if needed
   if (!city || !country) {
     const parsed = (label || "").split(",").map(s => s.trim()).filter(Boolean);
     if (!city && parsed.length >= 2) city = parsed[0];
@@ -181,7 +213,7 @@ async function buildHeadquarters(entities, headquartersId) {
 
   return {
     raw: label,
-    place: label,     // most-specific place (e.g., "Mountain View")
+    place: label,
     city: city || null,
     region: region || null,
     country: country || null,
@@ -189,19 +221,19 @@ async function buildHeadquarters(entities, headquartersId) {
   };
 }
 
-// ---------- Finance ----------
+/* --------------------------------- Finance ---------------------------------- */
 async function fetchFinnhubQuote(symbol) {
   const key = process.env.FINNHUB_API_KEY;
   if (!key || !symbol) return null;
   const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${key}`;
   const res = await fetch(url);
   if (!res.ok) return null;
-  const j = await res.json(); // { c: price, ... }
+  const j = await res.json();
   if (!j || typeof j.c !== "number") return null;
   return { stock_price: j.c };
 }
 
-// Unofficial Yahoo Finance fallback (no API key). May change without notice.
+// Unofficial Yahoo Finance fallback (no key). Subject to change by Yahoo.
 async function fetchYahooFinance(symbol) {
   if (!symbol) return null;
   const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=price,summaryDetail,defaultKeyStatistics`;
@@ -212,16 +244,16 @@ async function fetchYahooFinance(symbol) {
   if (!r) return null;
   const price = r.price?.regularMarketPrice?.raw ?? r.price?.postMarketPrice?.raw ?? null;
   const mc = r.price?.marketCap?.raw
-    ?? r.summaryDetail?.marketCap?.raw
-    ?? r.defaultKeyStatistics?.enterpriseValue?.raw
-    ?? null;
+          ?? r.summaryDetail?.marketCap?.raw
+          ?? r.defaultKeyStatistics?.enterpriseValue?.raw
+          ?? null;
   return {
     stock_price: typeof price === "number" ? price : null,
     market_cap: typeof mc === "number" ? mc : null
   };
 }
 
-// ---------- OpenCorporates ----------
+/* ------------------------------ OpenCorporates ------------------------------- */
 async function fetchOpenCorporates(query) {
   const token = process.env.OPENCORPORATES_API_TOKEN;
   const url = `https://api.opencorporates.com/companies/search?q=${encodeURIComponent(query)}${token ? `&api_token=${token}` : ""}&per_page=1`;
@@ -236,7 +268,7 @@ async function fetchOpenCorporates(query) {
   };
 }
 
-// ---------- Social links from company website ----------
+/* ----------------------- Social links from company site ---------------------- */
 const SOCIAL_DOMAINS = {
   x: ["x.com","twitter.com"],
   facebook: ["facebook.com"],
@@ -249,7 +281,7 @@ const SOCIAL_DOMAINS = {
   reddit: ["reddit.com"],
   threads: ["threads.net"],
   bluesky: ["bsky.app"],
-  mastodon: ["mastodon.social","fosstodon.org","hachyderm.io"], // plus any rel=me links
+  mastodon: ["mastodon.social","fosstodon.org","hachyderm.io"], // extend as needed
   pinterest: ["pinterest.com"]
 };
 
@@ -267,38 +299,28 @@ function classifySocial(url) {
 async function fetchCompanySocials(website) {
   if (!website) return null;
   try {
-    // Normalize: ensure protocol
     const url = website.startsWith("http") ? website : `https://${website}`;
     const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
     if (!res.ok) return null;
     const html = await res.text();
 
-    // Extract hrefs (simple scan)
     const hrefs = Array.from(html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)).map(m => m[1]);
-
-    // Also look for rel="me" links (Mastodon/identity)
-    const relMe = Array.from(html.matchAll(/<a[^>]+rel=["'][^"']*?\bme\b[^"']*?["'][^>]*href=["']([^"']+)["']/gi))
-      .map(m => m[1]);
+    const relMe = Array.from(html.matchAll(/<a[^>]+rel=["'][^"']*?\bme\b[^"']*?["'][^>]*href=["']([^"']+)["']/gi)).map(m => m[1]);
 
     const links = unique([...hrefs, ...relMe].filter(h => /^https?:\/\//i.test(h)));
 
     const result = {};
     for (const link of links) {
       const key = classifySocial(link);
-      if (key) {
-        if (!result[key]) result[key] = link;
-        // Prefer more "official-looking" links for some platforms (e.g., /company/ vs /share)
-        // Keep the first seen; you can add smarter heuristics later.
-      }
+      if (key && !result[key]) result[key] = link;
     }
-
     return Object.keys(result).length ? result : null;
   } catch {
     return null;
   }
 }
 
-// ---------- Puppeteer: scrape Wikipedia infobox ----------
+/* ----------------------- Puppeteer: Wikipedia infobox ------------------------ */
 async function scrapeWikipediaInfobox(browser, wikiUrl) {
   const page = await browser.newPage();
   await page.setUserAgent(
@@ -352,7 +374,7 @@ async function scrapeWikipediaInfobox(browser, wikiUrl) {
   return data;
 }
 
-// ---------- Main handler ----------
+/* -------------------------------- Main handler ------------------------------- */
 module.exports = async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
@@ -400,7 +422,7 @@ module.exports = async function handler(req, res) {
       const main = entities?.[wikidataId] || null;
       const {
         website: wdWebsite,
-        employees: wdEmployees,
+        employees: wdEmployees, // { count, as_of } or null
         industryIds, headquartersId, typeIds,
         tickers: tickerPairs
       } = extractFromWikidata(main);
@@ -412,13 +434,13 @@ module.exports = async function handler(req, res) {
       const industries = resolveLabels(labelEntities, industryIds || []);
       const types = resolveLabels(labelEntities, typeIds || []);
 
-      // Build HQ structured object
+      // HQ structured object
       if (headquartersId) {
         const extended = { ...(labelEntities || {}), ...(entities || {}) };
         hqStruct = await buildHeadquarters(extended, headquartersId);
       }
 
-      // Build ticker list with exchange names
+      // Tickers w/ exchange names
       tickers = (tickerPairs || []).map(t => ({
         symbol: t.symbol,
         exchange: t.exchangeId ? (resolveLabels(labelEntities, [t.exchangeId])[0] || null) : null
@@ -426,13 +448,13 @@ module.exports = async function handler(req, res) {
 
       enriched = {
         website: wdWebsite || null,
-        company_size: wdEmployees || null,
+        employees: wdEmployees || null,
         industry: industries.length ? industries : null,
         type: types.length ? types.join(", ") : null
       };
     }
 
-    // Choose a primary ticker if any
+    // Primary ticker
     const choosePrimaryTicker = (arr) => {
       if (!arr?.length) return null;
       for (const pref of EXCHANGE_PREFERENCE) {
@@ -443,7 +465,7 @@ module.exports = async function handler(req, res) {
     };
     const primaryTicker = choosePrimaryTicker(tickers);
 
-    // Finance: try Finnhub (if key), else Yahoo as a fallback
+    // Finance
     let financials = null;
     if (primaryTicker) {
       financials = await fetchFinnhubQuote(primaryTicker) || await fetchYahooFinance(primaryTicker);
@@ -463,13 +485,16 @@ module.exports = async function handler(req, res) {
     // OpenCorporates (optional)
     const openCorporates = await fetchOpenCorporates(q);
 
+    // Employees: prefer Wikidata structured; else parse Wikipedia string
+    const wikiEmployeesParsed = parseEmployeesString(wiki.company_size);
+    const employees = enriched.employees || wikiEmployeesParsed || null;
+
     // Merge baseline + enriched
     const merged = {
       name: wiki.name || q,
       website: enriched.website || wiki.website || null,
-      employees: enriched.company_size || wiki.company_size || null,
+      employees, // { count, as_of } or null
       industry: unique([...(wiki.industry || []), ...(enriched.industry || [])]),
-      // HQ structured (prefer Wikidata struct; else try to parse Wikipedia text)
       headquarters: hqStruct || (wiki.headquarters ? {
         raw: wiki.headquarters,
         place: wiki.headquarters.split(",")[0]?.trim() || null,
@@ -482,7 +507,7 @@ module.exports = async function handler(req, res) {
       specialties: unique(wiki.specialties || [])
     };
 
-    // Socials from company website (if any)
+    // Socials from official website
     const socials = await fetchCompanySocials(merged.website);
 
     const payload = {
@@ -504,7 +529,7 @@ module.exports = async function handler(req, res) {
       },
       scrapedAt: new Date().toISOString(),
       data: payload,
-      tickers // keep for debugging; remove if you want
+      tickers // for debugging; remove if you prefer
     });
 
   } catch (err) {
